@@ -142,6 +142,9 @@ func timespecToTime(ts syscall.Timespec) time.Time {
 }
 
 func (s *storageFS) UpdateBucket(bucketName string, attrsToUpdate BucketAttrs) error {
+	if BucketNameInvalid(bucketName) {
+		return InvalidBucketName
+	}
 	if attrsToUpdate.VersioningEnabled {
 		return errors.New("not implemented: fs storage type does not support versioning yet")
 	}
@@ -165,6 +168,9 @@ func (s *storageFS) UpdateBucket(bucketName string, attrsToUpdate BucketAttrs) e
 }
 
 func (s *storageFS) UpdateBucketACL(bucketName string, acl []storage.ACLRule) error {
+	if BucketNameInvalid(bucketName) {
+		return InvalidBucketName
+	}
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	path := filepath.Join(s.rootDir, url.PathEscape(bucketName))

@@ -553,6 +553,49 @@ func TestSignedURLResumableStartRejectsPathEscape(t *testing.T) {
 	}
 }
 
+func TestPatchBucketDotDotDoesNotWriteOutsideStorageRoot(t *testing.T) {
+	server, root := startFSSignedServer(t)
+	client := server.HTTPClient()
+	parent := filepath.Dir(root)
+	before, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, body := range []string{"{}", `{"defaultEventBasedHold":true}`} {
+		req, err := http.NewRequest(http.MethodPatch, server.ts.URL+"/storage/v1/b/%2e%2e", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("PATCH /storage/v1/b/%%2e%%2e body %s: want 400, got %d", body, resp.StatusCode)
+		}
+	}
+
+	if _, err := os.Stat(parent + ".bucketMetadata"); err == nil {
+		t.Fatal("wrote bucketMetadata beside the parent of StorageRoot")
+	}
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != len(before) {
+		t.Fatalf("parent of StorageRoot changed: before %d entries, after %d", len(before), len(entries))
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), "bucketMetadata") {
+			t.Fatalf("unexpected metadata outside root: %s", e.Name())
+		}
+	}
+}
+
 func TestSignedURLResumableLocationQueryEscapesObjectName(t *testing.T) {
 	server, _ := startFSSignedServer(t)
 	const bucketName = "session-bucket"

@@ -46,6 +46,9 @@ func (s *Server) updateBucket(r *http.Request) jsonResponse {
 	if err == backend.BucketNotFound {
 		return jsonResponse{status: http.StatusNotFound}
 	}
+	if err == backend.InvalidBucketName {
+		return jsonResponse{status: http.StatusBadRequest, errorMessage: err.Error()}
+	}
 	if err != nil {
 		return jsonResponse{errorMessage: err.Error(), status: http.StatusInternalServerError}
 	}
