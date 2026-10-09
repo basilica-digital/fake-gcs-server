@@ -7,7 +7,7 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@v7
 
       - name: docker meta
         id: meta
