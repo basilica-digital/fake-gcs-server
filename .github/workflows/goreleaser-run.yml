@@ -1,8 +1,7 @@
 name: goreleaser
+# Basilica fork does not cut GitHub Releases via goreleaser.
 on:
-  push:
-    tags:
-      - "*"
+  workflow_dispatch:
 
 permissions:
   contents: write

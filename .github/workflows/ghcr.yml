@@ -1,0 +1,78 @@
+name: ghcr
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+      - "*-maypop.*"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: test
+        run: go test ./...
+
+      - name: setup qemu
+        uses: docker/setup-qemu-action@v3
+
+      - name: setup buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: login to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: image tags
+        id: tags
+        run: |
+          image=ghcr.io/basilica-digital/fake-gcs-server
+          sha12="${GITHUB_SHA:0:12}"
+          tags="${image}:sha-${sha12}"
+          if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            tags="${tags},${image}:main"
+          fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tags="${tags},${image}:${GITHUB_REF_NAME}"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "tags=${tags}"
+
+      - name: build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.tags.outputs.tags }}
+
+      # GHCR packages are created private. GITHUB_TOKEN cannot always flip
+      # visibility; if this fails, set the package public once in the GitHub UI
+      # (Package settings → Change visibility → Public) so `podman pull` needs
+      # no token.
+      - name: make package public
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -sS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/orgs/basilica-digital/packages/container/fake-gcs-server/visibility \
+            -d '{"visibility":"public"}' || true

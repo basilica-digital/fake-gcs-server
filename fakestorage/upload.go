@@ -105,8 +105,10 @@ type resumableUploadBody struct {
 }
 
 type generationCondition struct {
-	ifGenerationMatch    *int64
-	ifGenerationNotMatch *int64
+	ifGenerationMatch        *int64
+	ifGenerationNotMatch     *int64
+	ifMetagenerationMatch    *int64
+	ifMetagenerationNotMatch *int64
 }
 
 func (c generationCondition) ConditionsMet(activeGeneration int64) bool {
@@ -114,6 +116,26 @@ func (c generationCondition) ConditionsMet(activeGeneration int64) bool {
 		return false
 	}
 	if c.ifGenerationNotMatch != nil && *c.ifGenerationNotMatch == activeGeneration {
+		return false
+	}
+	return true
+}
+
+// objectExistsMetageneration is the XML/JSON metageneration the emulator
+// reports for a live object (responses hard-code 1). Absent objects are 0.
+func objectExistsMetageneration(exists bool) int64 {
+	if exists {
+		return 1
+	}
+	return 0
+}
+
+func (c generationCondition) metaConditionsMet(exists bool) bool {
+	active := objectExistsMetageneration(exists)
+	if c.ifMetagenerationMatch != nil && *c.ifMetagenerationMatch != active {
+		return false
+	}
+	if c.ifMetagenerationNotMatch != nil && *c.ifMetagenerationNotMatch == active {
 		return false
 	}
 	return true
@@ -168,6 +190,11 @@ func (s *Server) insertObject(r *http.Request) jsonResponse {
 	if _, err := s.backend.GetBucket(bucketName); err != nil {
 		return jsonResponse{status: http.StatusNotFound}
 	}
+
+	if isSignedResumableStart(r) {
+		return s.signedResumableStart(bucketName, r)
+	}
+
 	uploadType := r.URL.Query().Get("uploadType")
 	if uploadType == "" && r.Header.Get("X-Goog-Upload-Protocol") == uploadTypeResumable {
 		uploadType = uploadTypeResumable
@@ -191,6 +218,88 @@ func (s *Server) insertObject(r *http.Request) jsonResponse {
 			}
 		}
 		return jsonResponse{errorMessage: "invalid uploadType", status: http.StatusBadRequest}
+	}
+}
+
+func isSignedResumableStart(r *http.Request) bool {
+	if !strings.EqualFold(r.Header.Get("x-goog-resumable"), "start") {
+		return false
+	}
+	if unescapeMuxVars(mux.Vars(r))["objectName"] == "" {
+		return false
+	}
+	return requestBodyEmpty(r)
+}
+
+func requestBodyEmpty(r *http.Request) bool {
+	if r.Body == nil || r.Body == http.NoBody {
+		return true
+	}
+	if r.ContentLength == 0 {
+		return true
+	}
+	if r.ContentLength > 0 {
+		return false
+	}
+	buf, err := io.ReadAll(r.Body)
+	r.Body.Close()
+	r.Body = io.NopCloser(bytes.NewReader(buf))
+	return err == nil && len(buf) == 0
+}
+
+func (s *Server) signedResumableStart(bucketName string, r *http.Request) jsonResponse {
+	objName := unescapeMuxVars(mux.Vars(r))["objectName"]
+	conditions, err := s.wrapUploadPreconditions(r, bucketName, objName)
+	if err != nil {
+		return jsonResponse{status: http.StatusBadRequest, errorMessage: err.Error()}
+	}
+
+	live, liveErr := s.GetObject(bucketName, objName)
+	exists := liveErr == nil
+	var gen int64
+	if exists {
+		gen = live.Generation
+	}
+	if !conditions.ConditionsMet(gen) || !conditions.metaConditionsMet(exists) {
+		header := make(http.Header)
+		if exists {
+			header.Set("x-goog-generation", strconv.FormatInt(gen, 10))
+		}
+		return jsonResponse{
+			status:       http.StatusPreconditionFailed,
+			errorMessage: backend.PreConditionFailed.Error(),
+			header:       header,
+		}
+	}
+
+	obj := Object{
+		ObjectAttrs: ObjectAttrs{
+			BucketName: bucketName,
+			Name:       objName,
+			ACL:        getObjectACL(r.URL.Query().Get("predefinedAcl")),
+		},
+	}
+	uploadID, err := generateUploadID()
+	if err != nil {
+		return jsonResponse{errorMessage: err.Error()}
+	}
+	s.uploads.Store(uploadID, resumableUploadEntry{obj: obj, conditions: conditions})
+	header := make(http.Header)
+	baseURL := s.URL()
+	if baseURL == "" {
+		baseURL = urlhelper.GetBaseURL(r)
+	}
+	location := fmt.Sprintf(
+		"%s/upload/storage/v1/b/%s/o?uploadType=resumable&name=%s&upload_id=%s",
+		baseURL,
+		bucketName,
+		url.PathEscape(objName),
+		uploadID,
+	)
+	header.Set("Location", location)
+	return jsonResponse{
+		data:   newObjectResponse(obj.ObjectAttrs, baseURL),
+		header: header,
 	}
 }
 
@@ -414,31 +523,52 @@ func (s *Server) insertFormObject(r *http.Request) xmlResponse {
 	return xmlResponse{status: successActionStatus}
 }
 
+func parseOptionalInt64Param(queryVal, headerVal string) (*int64, error) {
+	raw := queryVal
+	if raw == "" {
+		raw = headerVal
+	}
+	if raw == "" {
+		return nil, nil
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	return &n, nil
+}
+
 func (s *Server) wrapUploadPreconditions(r *http.Request, bucketName string, objectName string) (generationCondition, error) {
-	result := generationCondition{
-		ifGenerationMatch:    nil,
-		ifGenerationNotMatch: nil,
+	result := generationCondition{}
+	var err error
+	result.ifGenerationMatch, err = parseOptionalInt64Param(
+		r.URL.Query().Get("ifGenerationMatch"),
+		r.Header.Get("x-goog-if-generation-match"),
+	)
+	if err != nil {
+		return generationCondition{}, err
 	}
-	ifGenerationMatch := r.URL.Query().Get("ifGenerationMatch")
-
-	if ifGenerationMatch != "" {
-		gen, err := strconv.ParseInt(ifGenerationMatch, 10, 64)
-		if err != nil {
-			return generationCondition{}, err
-		}
-		result.ifGenerationMatch = &gen
+	result.ifGenerationNotMatch, err = parseOptionalInt64Param(
+		r.URL.Query().Get("ifGenerationNotMatch"),
+		r.Header.Get("x-goog-if-generation-not-match"),
+	)
+	if err != nil {
+		return generationCondition{}, err
 	}
-
-	ifGenerationNotMatch := r.URL.Query().Get("ifGenerationNotMatch")
-
-	if ifGenerationNotMatch != "" {
-		gen, err := strconv.ParseInt(ifGenerationNotMatch, 10, 64)
-		if err != nil {
-			return generationCondition{}, err
-		}
-		result.ifGenerationNotMatch = &gen
+	result.ifMetagenerationMatch, err = parseOptionalInt64Param(
+		r.URL.Query().Get("ifMetagenerationMatch"),
+		r.Header.Get("x-goog-if-metageneration-match"),
+	)
+	if err != nil {
+		return generationCondition{}, err
 	}
-
+	result.ifMetagenerationNotMatch, err = parseOptionalInt64Param(
+		r.URL.Query().Get("ifMetagenerationNotMatch"),
+		r.Header.Get("x-goog-if-metageneration-not-match"),
+	)
+	if err != nil {
+		return generationCondition{}, err
+	}
 	return result, nil
 }
 

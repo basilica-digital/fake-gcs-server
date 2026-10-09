@@ -1,3 +1,16 @@
+# fake-gcs-server (basilica-digital)
+
+This is a public fork of [fsouza/fake-gcs-server](https://github.com/fsouza/fake-gcs-server)
+at `v1.56.1`. It adds signed-URL resumable upload start (`x-goog-resumable: start`
+on `POST`/`PUT /{bucket}/{object}`) with generation preconditions from
+`x-goog-if-generation-match` (and related) headers.
+
+Images are published to `ghcr.io/basilica-digital/fake-gcs-server` (no `:latest`
+tag). Maypop pins `1.56.1-maypop.1`. The GHCR package must be **public** so
+`podman pull` needs no token: after the first image is pushed, GitHub → Packages
+→ `fake-gcs-server` → Package settings → Change visibility → Public (the
+workflow tries the API, but `GITHUB_TOKEN` often cannot flip visibility).
+
 # fake-gcs-server
 
 [![Build Status](https://github.com/fsouza/fake-gcs-server/workflows/Build/badge.svg)](https://github.com/fsouza/fake-gcs-server/actions?query=branch:main+workflow:Build)
