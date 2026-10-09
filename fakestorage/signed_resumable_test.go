@@ -112,13 +112,14 @@ func TestSignedURLResumableStartCreatesObjectOnFilesystem(t *testing.T) {
 			if chunkResp.StatusCode != http.StatusOK {
 				t.Fatalf("chunk PUT: want 200, got %d", chunkResp.StatusCode)
 			}
-			if chunkResp.Header.Get("x-goog-generation") == "" {
-				t.Fatal("finalize 200 must set x-goog-generation")
-			}
-
 			obj, err := server.GetObject(bucketName, objectName)
 			if err != nil {
 				t.Fatal(err)
+			}
+			gotGen := chunkResp.Header.Get("x-goog-generation")
+			wantGen := strconv.FormatInt(obj.Generation, 10)
+			if gotGen != wantGen {
+				t.Fatalf("finalize x-goog-generation: want %s, got %q", wantGen, gotGen)
 			}
 			if string(obj.Content) != "archive-bytes" {
 				t.Errorf("object content: want %q, got %q", "archive-bytes", string(obj.Content))
@@ -367,6 +368,41 @@ func TestSignedURLResumableStartQueryPreconditionsAndContentType(t *testing.T) {
 	if obj.CacheControl != "private" {
 		t.Errorf("cache control: want private, got %q", obj.CacheControl)
 	}
+
+	// Query ifGenerationMatch=0 must 412 when the object now exists.
+	failURL := server.ts.URL + "/" + bucketName + "/" + objectName + "?ifGenerationMatch=0"
+	failReq, err := http.NewRequest(http.MethodPost, failURL, strings.NewReader(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	failReq.Header.Set("x-goog-resumable", "start")
+	failResp, err := client.Do(failReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, failResp.Body)
+	failResp.Body.Close()
+	if failResp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("query ifGenerationMatch=0 on existing object: want 412, got %d", failResp.StatusCode)
+	}
+
+	// Query wins over a matching header: query 0 vs header live generation is 412.
+	conflictURL := server.ts.URL + "/" + bucketName + "/" + objectName + "?ifGenerationMatch=0"
+	conflictReq, err := http.NewRequest(http.MethodPost, conflictURL, strings.NewReader(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflictReq.Header.Set("x-goog-resumable", "start")
+	conflictReq.Header.Set("x-goog-if-generation-match", strconv.FormatInt(obj.Generation, 10))
+	conflictResp, err := client.Do(conflictReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, conflictResp.Body)
+	conflictResp.Body.Close()
+	if conflictResp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("query 0 overrides matching header: want 412, got %d", conflictResp.StatusCode)
+	}
 }
 
 func TestSignedURLResumableFinalizeEnforcesStoredPreconditions(t *testing.T) {
@@ -457,6 +493,12 @@ func TestSignedURLResumableStartRejectsPathEscape(t *testing.T) {
 	const bucketName = "session-bucket"
 	server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName})
 	client := server.HTTPClient()
+	parent := filepath.Dir(root)
+	before, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	startURL := server.ts.URL + "/" + bucketName + "/%2e%2e/escaped.txt"
 	initResp := signedResumableStart(t, client, startURL, "0")
 	_, _ = io.Copy(io.Discard, initResp.Body)
@@ -464,12 +506,50 @@ func TestSignedURLResumableStartRejectsPathEscape(t *testing.T) {
 	if initResp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("path-escaping object name: want 400, got %d", initResp.StatusCode)
 	}
-	outside := filepath.Join(filepath.Dir(root), "escaped.txt")
+	if loc := initResp.Header.Get("Location"); loc != "" {
+		t.Fatalf("rejected start must not return Location, got %q", loc)
+	}
+	outside := filepath.Join(parent, "escaped.txt")
 	if _, err := os.Stat(outside); err == nil {
 		t.Fatalf("wrote file outside storage root: %s", outside)
 	}
 	if _, err := os.Stat(filepath.Join(root, "escaped.txt")); err == nil {
 		t.Fatal("wrote escaped object at storage root")
+	}
+
+	for _, name := range []string{"foo/..", "foo/../bar", "."} {
+		u := server.ts.URL + "/" + bucketName + "/" + name
+		resp := signedResumableStart(t, client, u, "0")
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("object name %q: want 400, got %d", name, resp.StatusCode)
+		}
+	}
+
+	dotdot := signedResumableStart(t, client, server.ts.URL+"/%2e%2e/pwned.txt", "0")
+	_, _ = io.Copy(io.Discard, dotdot.Body)
+	dotdot.Body.Close()
+	if dotdot.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bucket .. start: want 400, got %d", dotdot.StatusCode)
+	}
+	if loc := dotdot.Header.Get("Location"); loc != "" {
+		t.Fatalf("bucket .. start must not return Location, got %q", loc)
+	}
+	if _, err := os.Stat(filepath.Join(parent, "pwned.txt")); err == nil {
+		t.Fatal("wrote pwned.txt outside storage root")
+	}
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != len(before) {
+		t.Fatalf("parent of StorageRoot changed: before %d entries, after %d", len(before), len(entries))
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), "bucketMetadata") {
+			t.Fatalf("unexpected metadata outside root: %s", e.Name())
+		}
 	}
 }
 

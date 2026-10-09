@@ -52,10 +52,20 @@ const (
 	BucketNotEmpty     = Error("bucket must be empty prior to deletion")
 	PreConditionFailed = Error("Precondition failed")
 	InvalidObjectName  = Error("invalid object name")
+	InvalidBucketName  = Error("invalid bucket name")
 )
 
+// BucketNameInvalid is true for names that must not become a directory under
+// the storage root (empty, ".", "..", or containing a path separator).
+func BucketNameInvalid(name string) bool {
+	if name == "" || name == "." || name == ".." {
+		return true
+	}
+	return strings.ContainsAny(name, `/\`) || strings.ContainsRune(name, 0)
+}
+
 // ObjectNameEscapesBucket is true when name would resolve outside the bucket
-// directory after path cleaning (for example "..", "a/../../outside").
+// directory, collapse to another name, or is empty/"."/"..".
 func ObjectNameEscapesBucket(objectName string) bool {
 	if objectName == "" || strings.ContainsRune(objectName, 0) {
 		return true
@@ -64,5 +74,11 @@ func ObjectNameEscapesBucket(objectName string) bool {
 	if path.IsAbs(cleaned) {
 		return true
 	}
-	return cleaned == ".." || strings.HasPrefix(cleaned, "../")
+	if cleaned == "." || cleaned == ".." {
+		return true
+	}
+	if strings.HasPrefix(cleaned, "../") {
+		return true
+	}
+	return cleaned != objectName
 }

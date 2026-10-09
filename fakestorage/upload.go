@@ -186,6 +186,9 @@ func (s *Server) insertObject(r *http.Request) jsonResponse {
 	}
 
 	bucketName := unescapeMuxVars(mux.Vars(r))["bucketName"]
+	if backend.BucketNameInvalid(bucketName) {
+		return jsonResponse{status: http.StatusBadRequest, errorMessage: backend.InvalidBucketName.Error()}
+	}
 
 	if _, err := s.backend.GetBucket(bucketName); err != nil {
 		return jsonResponse{status: http.StatusNotFound}
@@ -248,6 +251,9 @@ func requestBodyEmpty(r *http.Request) bool {
 }
 
 func (s *Server) signedResumableStart(bucketName string, r *http.Request) jsonResponse {
+	if backend.BucketNameInvalid(bucketName) {
+		return jsonResponse{status: http.StatusBadRequest, errorMessage: backend.InvalidBucketName.Error()}
+	}
 	objName := unescapeMuxVars(mux.Vars(r))["objectName"]
 	if backend.ObjectNameEscapesBucket(objName) {
 		return jsonResponse{status: http.StatusBadRequest, errorMessage: backend.InvalidObjectName.Error()}

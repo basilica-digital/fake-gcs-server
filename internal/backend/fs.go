@@ -83,6 +83,9 @@ func (s *storageFS) CreateBucket(name string, bucketAttrs BucketAttrs) error {
 }
 
 func (s *storageFS) createBucket(name string, bucketAttrs BucketAttrs) error {
+	if BucketNameInvalid(name) {
+		return InvalidBucketName
+	}
 	if bucketAttrs.VersioningEnabled {
 		return errors.New("not implemented: fs storage type does not support versioning yet")
 	}
@@ -180,6 +183,9 @@ func (s *storageFS) UpdateBucketACL(bucketName string, acl []storage.ACLRule) er
 // GetBucket returns information about the given bucket, or an error if it
 // doesn't exist.
 func (s *storageFS) GetBucket(name string) (Bucket, error) {
+	if BucketNameInvalid(name) {
+		return Bucket{}, InvalidBucketName
+	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 	path := filepath.Join(s.rootDir, url.PathEscape(name))
@@ -389,6 +395,9 @@ func (s *storageFS) getObject(bucketName, objectName string) (StreamingObject, e
 }
 
 func (s *storageFS) objectFilePath(bucketName, objectName string) (string, error) {
+	if BucketNameInvalid(bucketName) {
+		return "", InvalidBucketName
+	}
 	if ObjectNameEscapesBucket(objectName) {
 		return "", InvalidObjectName
 	}
