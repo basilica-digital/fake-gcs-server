@@ -14,7 +14,10 @@ import (
 	"testing"
 )
 
-const signedAlgoQuery = "X-Goog-Algorithm=GOOG4-RSA-SHA256"
+const (
+	signedAlgoQuery   = "X-Goog-Algorithm=GOOG4-RSA-SHA256"
+	signedExternalURL = "http://gcs.example.test:4443"
+)
 
 func startFSSignedServer(t *testing.T) (*Server, string) {
 	t.Helper()
@@ -23,7 +26,7 @@ func startFSSignedServer(t *testing.T) (*Server, string) {
 		Scheme:      "http",
 		PublicHost:  "127.0.0.1",
 		StorageRoot: dir,
-		ExternalURL: "",
+		ExternalURL: signedExternalURL,
 	})
 	if err != nil {
 		t.Fatalf("could not start server: %v", err)
@@ -77,7 +80,7 @@ func TestSignedURLResumableStartCreatesObjectOnFilesystem(t *testing.T) {
 			server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName})
 			client := server.HTTPClient()
 
-			startURL := server.URL() + "/" + bucketName + "/" + objectName
+			startURL := server.ts.URL + "/" + bucketName + "/" + objectName
 			if withAlgo {
 				startURL += "?" + signedAlgoQuery
 			}
@@ -91,8 +94,16 @@ func TestSignedURLResumableStartCreatesObjectOnFilesystem(t *testing.T) {
 			if location == "" {
 				t.Fatal("signed resumable start: missing Location")
 			}
+			if !strings.HasPrefix(location, signedExternalURL+"/") {
+				t.Errorf("Location %q should use -external-url %s", location, signedExternalURL)
+			}
 			if !strings.Contains(location, "uploadType=resumable") {
 				t.Errorf("Location %q should be the JSON resumable upload URL", location)
+			}
+
+			_, err := server.GetObject(bucketName, objectName)
+			if err == nil {
+				t.Fatal("object must be absent after start and before chunk")
 			}
 
 			chunkResp := putLocationChunk(t, client, location, "archive-bytes")
@@ -100,6 +111,9 @@ func TestSignedURLResumableStartCreatesObjectOnFilesystem(t *testing.T) {
 			chunkResp.Body.Close()
 			if chunkResp.StatusCode != http.StatusOK {
 				t.Fatalf("chunk PUT: want 200, got %d", chunkResp.StatusCode)
+			}
+			if chunkResp.Header.Get("x-goog-generation") == "" {
+				t.Fatal("finalize 200 must set x-goog-generation")
 			}
 
 			obj, err := server.GetObject(bucketName, objectName)
@@ -147,7 +161,7 @@ func TestSignedURLResumableStartGenerationZeroWhenObjectExists(t *testing.T) {
 			}
 			client := server.HTTPClient()
 
-			startURL := server.URL() + "/" + bucketName + "/" + objectName
+			startURL := server.ts.URL + "/" + bucketName + "/" + objectName
 			if withAlgo {
 				startURL += "?" + signedAlgoQuery
 			}
@@ -202,7 +216,7 @@ func TestSignedURLResumableStartLiveGenerationThenStaleStart(t *testing.T) {
 			oldGen := first.Generation
 			client := server.HTTPClient()
 
-			startURL := server.URL() + "/" + bucketName + "/" + objectName
+			startURL := server.ts.URL + "/" + bucketName + "/" + objectName
 			if withAlgo {
 				startURL += "?" + signedAlgoQuery
 			}
@@ -261,7 +275,7 @@ func TestSignedURLResumableStartOmitsGenerationWhenObjectAbsent(t *testing.T) {
 	const bucketName = "session-bucket"
 	server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName})
 	client := server.HTTPClient()
-	startURL := server.URL() + "/" + bucketName + "/missing.tar"
+	startURL := server.ts.URL + "/" + bucketName + "/missing.tar"
 	// Match a non-zero generation while the object is absent.
 	initResp := signedResumableStart(t, client, startURL, "99")
 	_, _ = io.Copy(io.Discard, initResp.Body)
@@ -311,5 +325,185 @@ func TestWrapUploadPreconditionsReadsGoogHeaders(t *testing.T) {
 	}
 	if c.metaConditionsMet(false) {
 		t.Error("absent object metageneration should fail match 1")
+	}
+}
+
+func TestSignedURLResumableStartQueryPreconditionsAndContentType(t *testing.T) {
+	server, _ := startFSSignedServer(t)
+	const bucketName = "session-bucket"
+	const objectName = "apps/abc/session.tar"
+	server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName})
+	client := server.HTTPClient()
+	startURL := server.ts.URL + "/" + bucketName + "/" + objectName + "?ifGenerationMatch=0"
+	req, err := http.NewRequest(http.MethodPost, startURL, strings.NewReader(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("x-goog-resumable", "start")
+	req.Header.Set("Content-Type", "application/x-tar")
+	req.Header.Set("Cache-Control", "private")
+	initResp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, initResp.Body)
+	initResp.Body.Close()
+	if initResp.StatusCode != http.StatusOK {
+		t.Fatalf("query ifGenerationMatch=0 start: want 200, got %d", initResp.StatusCode)
+	}
+	chunkResp := putLocationChunk(t, client, initResp.Header.Get("Location"), "tar-bytes")
+	_, _ = io.Copy(io.Discard, chunkResp.Body)
+	chunkResp.Body.Close()
+	if chunkResp.StatusCode != http.StatusOK {
+		t.Fatalf("chunk PUT: want 200, got %d", chunkResp.StatusCode)
+	}
+	obj, err := server.GetObject(bucketName, objectName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obj.ContentType != "application/x-tar" {
+		t.Errorf("content type: want application/x-tar, got %q", obj.ContentType)
+	}
+	if obj.CacheControl != "private" {
+		t.Errorf("cache control: want private, got %q", obj.CacheControl)
+	}
+}
+
+func TestSignedURLResumableFinalizeEnforcesStoredPreconditions(t *testing.T) {
+	server, _ := startFSSignedServer(t)
+	const bucketName = "session-bucket"
+	const objectName = "apps/abc/session.tar"
+	server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName})
+	client := server.HTTPClient()
+	startURL := server.ts.URL + "/" + bucketName + "/" + objectName
+	initResp := signedResumableStart(t, client, startURL, "0")
+	_, _ = io.Copy(io.Discard, initResp.Body)
+	initResp.Body.Close()
+	if initResp.StatusCode != http.StatusOK {
+		t.Fatalf("start: want 200, got %d", initResp.StatusCode)
+	}
+	location := initResp.Header.Get("Location")
+	server.CreateObject(Object{
+		ObjectAttrs: ObjectAttrs{BucketName: bucketName, Name: objectName},
+		Content:     []byte("racer"),
+	})
+	live, err := server.GetObject(bucketName, objectName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunkResp := putLocationChunk(t, client, location, "should-not-land")
+	_, _ = io.Copy(io.Discard, chunkResp.Body)
+	chunkResp.Body.Close()
+	if chunkResp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("finalize after racer: want 412, got %d", chunkResp.StatusCode)
+	}
+	gotGen := chunkResp.Header.Get("x-goog-generation")
+	wantGen := strconv.FormatInt(live.Generation, 10)
+	if gotGen != wantGen {
+		t.Errorf("finalize 412 x-goog-generation: want %s, got %q", wantGen, gotGen)
+	}
+	after, err := server.GetObject(bucketName, objectName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after.Content) != "racer" {
+		t.Errorf("racer bytes changed: got %q", string(after.Content))
+	}
+}
+
+func TestSignedURLResumableFinalizeEnforcesMetageneration(t *testing.T) {
+	server, _ := startFSSignedServer(t)
+	const bucketName = "session-bucket"
+	const objectName = "apps/abc/session.tar"
+	server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName})
+	client := server.HTTPClient()
+	startURL := server.ts.URL + "/" + bucketName + "/" + objectName
+	req, err := http.NewRequest(http.MethodPost, startURL, strings.NewReader(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("x-goog-resumable", "start")
+	req.Header.Set("x-goog-if-metageneration-match", "0")
+	initResp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, initResp.Body)
+	initResp.Body.Close()
+	if initResp.StatusCode != http.StatusOK {
+		t.Fatalf("start with metageneration match 0: want 200, got %d", initResp.StatusCode)
+	}
+	server.CreateObject(Object{
+		ObjectAttrs: ObjectAttrs{BucketName: bucketName, Name: objectName},
+		Content:     []byte("created-in-between"),
+	})
+	chunkResp := putLocationChunk(t, client, initResp.Header.Get("Location"), "overwrite")
+	_, _ = io.Copy(io.Discard, chunkResp.Body)
+	chunkResp.Body.Close()
+	if chunkResp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("finalize after object appeared: want 412, got %d", chunkResp.StatusCode)
+	}
+	after, err := server.GetObject(bucketName, objectName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after.Content) != "created-in-between" {
+		t.Errorf("object overwritten: got %q", string(after.Content))
+	}
+}
+
+func TestSignedURLResumableStartRejectsPathEscape(t *testing.T) {
+	server, root := startFSSignedServer(t)
+	const bucketName = "session-bucket"
+	server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName})
+	client := server.HTTPClient()
+	startURL := server.ts.URL + "/" + bucketName + "/%2e%2e/escaped.txt"
+	initResp := signedResumableStart(t, client, startURL, "0")
+	_, _ = io.Copy(io.Discard, initResp.Body)
+	initResp.Body.Close()
+	if initResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("path-escaping object name: want 400, got %d", initResp.StatusCode)
+	}
+	outside := filepath.Join(filepath.Dir(root), "escaped.txt")
+	if _, err := os.Stat(outside); err == nil {
+		t.Fatalf("wrote file outside storage root: %s", outside)
+	}
+	if _, err := os.Stat(filepath.Join(root, "escaped.txt")); err == nil {
+		t.Fatal("wrote escaped object at storage root")
+	}
+}
+
+func TestSignedURLResumableLocationQueryEscapesObjectName(t *testing.T) {
+	server, _ := startFSSignedServer(t)
+	const bucketName = "session-bucket"
+	const objectName = "victim&upload_id=other"
+	server.CreateBucketWithOpts(CreateBucketOpts{Name: bucketName})
+	client := server.HTTPClient()
+	startURL := server.ts.URL + "/" + bucketName + "/" + objectName
+	initResp := signedResumableStart(t, client, startURL, "0")
+	body, _ := io.ReadAll(initResp.Body)
+	initResp.Body.Close()
+	if initResp.StatusCode != http.StatusOK {
+		t.Fatalf("start: want 200, got %d (%s)", initResp.StatusCode, body)
+	}
+	location := initResp.Header.Get("Location")
+	if strings.Contains(location, "victim&upload_id=") {
+		t.Fatalf("Location left & unescaped: %s", location)
+	}
+	if !strings.Contains(location, "name=victim%26upload_id%3Dother") && !strings.Contains(location, "name=victim%26upload_id%3dother") {
+		t.Errorf("Location should query-escape object name, got %s", location)
+	}
+	chunkResp := putLocationChunk(t, client, location, "safe")
+	_, _ = io.Copy(io.Discard, chunkResp.Body)
+	chunkResp.Body.Close()
+	if chunkResp.StatusCode != http.StatusOK {
+		t.Fatalf("chunk PUT: want 200, got %d", chunkResp.StatusCode)
+	}
+	obj, err := server.GetObject(bucketName, objectName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(obj.Content) != "safe" {
+		t.Errorf("content: want safe, got %q", string(obj.Content))
 	}
 }

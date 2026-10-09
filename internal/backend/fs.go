@@ -263,7 +263,10 @@ func (s *storageFS) CreateObject(obj StreamingObject, conditions Conditions) (St
 		return StreamingObject{}, PreConditionFailed
 	}
 
-	path := filepath.Join(s.rootDir, url.PathEscape(obj.BucketName), obj.Name)
+	path, err := s.objectFilePath(obj.BucketName, obj.Name)
+	if err != nil {
+		return StreamingObject{}, err
+	}
 	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return StreamingObject{}, err
 	}
@@ -376,10 +379,32 @@ func (s *storageFS) getObject(bucketName, objectName string) (StreamingObject, e
 	}
 
 	obj := StreamingObject{ObjectAttrs: attrs}
-	path := filepath.Join(s.rootDir, url.PathEscape(bucketName), objectName)
+	path, err := s.objectFilePath(bucketName, objectName)
+	if err != nil {
+		return StreamingObject{}, err
+	}
 	err = openObjectAndSetSize(&obj, path)
 
 	return obj, err
+}
+
+func (s *storageFS) objectFilePath(bucketName, objectName string) (string, error) {
+	if ObjectNameEscapesBucket(objectName) {
+		return "", InvalidObjectName
+	}
+	bucketDir, err := filepath.Abs(filepath.Join(s.rootDir, url.PathEscape(bucketName)))
+	if err != nil {
+		return "", err
+	}
+	full, err := filepath.Abs(filepath.Join(bucketDir, filepath.FromSlash(objectName)))
+	if err != nil {
+		return "", err
+	}
+	sep := string(os.PathSeparator)
+	if full != bucketDir && !strings.HasPrefix(full, bucketDir+sep) {
+		return "", InvalidObjectName
+	}
+	return full, nil
 }
 
 func openObjectAndSetSize(obj *StreamingObject, path string) error {
@@ -395,7 +420,10 @@ func openObjectAndSetSize(obj *StreamingObject, path string) error {
 }
 
 func (s *storageFS) getObjectAttrs(bucketName, objectName string) (ObjectAttrs, error) {
-	path := filepath.Join(s.rootDir, url.PathEscape(bucketName), objectName)
+	path, err := s.objectFilePath(bucketName, objectName)
+	if err != nil {
+		return ObjectAttrs{}, err
+	}
 	encoded, err := s.mh.read(path)
 	if err != nil {
 		return ObjectAttrs{}, err
@@ -424,7 +452,10 @@ func (s *storageFS) DeleteObject(bucketName, objectName string) error {
 	if objectName == "" {
 		return errors.New("can't delete object with empty name")
 	}
-	path := filepath.Join(s.rootDir, url.PathEscape(bucketName), objectName)
+	path, err := s.objectFilePath(bucketName, objectName)
+	if err != nil {
+		return err
+	}
 	if err := s.mh.remove(path); err != nil {
 		return err
 	}

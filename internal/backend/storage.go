@@ -5,7 +5,12 @@
 // Package backend provides the backends used by fake-gcs-server.
 package backend
 
-import "cloud.google.com/go/storage"
+import (
+	"path"
+	"strings"
+
+	"cloud.google.com/go/storage"
+)
 
 type Conditions interface {
 	ConditionsMet(activeGeneration int64) bool
@@ -46,4 +51,18 @@ const (
 	BucketNotFound     = Error("bucket not found")
 	BucketNotEmpty     = Error("bucket must be empty prior to deletion")
 	PreConditionFailed = Error("Precondition failed")
+	InvalidObjectName  = Error("invalid object name")
 )
+
+// ObjectNameEscapesBucket is true when name would resolve outside the bucket
+// directory after path cleaning (for example "..", "a/../../outside").
+func ObjectNameEscapesBucket(objectName string) bool {
+	if objectName == "" || strings.ContainsRune(objectName, 0) {
+		return true
+	}
+	cleaned := path.Clean(objectName)
+	if path.IsAbs(cleaned) {
+		return true
+	}
+	return cleaned == ".." || strings.HasPrefix(cleaned, "../")
+}

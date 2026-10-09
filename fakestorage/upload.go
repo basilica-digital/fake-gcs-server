@@ -118,7 +118,7 @@ func (c generationCondition) ConditionsMet(activeGeneration int64) bool {
 	if c.ifGenerationNotMatch != nil && *c.ifGenerationNotMatch == activeGeneration {
 		return false
 	}
-	return true
+	return c.metaConditionsMet(activeGeneration != 0)
 }
 
 // objectExistsMetageneration is the XML/JSON metageneration the emulator
@@ -249,18 +249,22 @@ func requestBodyEmpty(r *http.Request) bool {
 
 func (s *Server) signedResumableStart(bucketName string, r *http.Request) jsonResponse {
 	objName := unescapeMuxVars(mux.Vars(r))["objectName"]
+	if backend.ObjectNameEscapesBucket(objName) {
+		return jsonResponse{status: http.StatusBadRequest, errorMessage: backend.InvalidObjectName.Error()}
+	}
 	conditions, err := s.wrapUploadPreconditions(r, bucketName, objName)
 	if err != nil {
 		return jsonResponse{status: http.StatusBadRequest, errorMessage: err.Error()}
 	}
 
-	live, liveErr := s.GetObject(bucketName, objName)
+	live, liveErr := s.GetObjectStreaming(bucketName, objName)
 	exists := liveErr == nil
 	var gen int64
 	if exists {
 		gen = live.Generation
+		_ = live.Close()
 	}
-	if !conditions.ConditionsMet(gen) || !conditions.metaConditionsMet(exists) {
+	if !conditions.ConditionsMet(gen) {
 		header := make(http.Header)
 		if exists {
 			header.Set("x-goog-generation", strconv.FormatInt(gen, 10))
@@ -274,9 +278,11 @@ func (s *Server) signedResumableStart(bucketName string, r *http.Request) jsonRe
 
 	obj := Object{
 		ObjectAttrs: ObjectAttrs{
-			BucketName: bucketName,
-			Name:       objName,
-			ACL:        getObjectACL(r.URL.Query().Get("predefinedAcl")),
+			BucketName:   bucketName,
+			Name:         objName,
+			ContentType:  r.Header.Get(contentTypeHeader),
+			CacheControl: r.Header.Get(cacheControlHeader),
+			ACL:          getObjectACL(r.URL.Query().Get("predefinedAcl")),
 		},
 	}
 	uploadID, err := generateUploadID()
@@ -289,18 +295,21 @@ func (s *Server) signedResumableStart(bucketName string, r *http.Request) jsonRe
 	if baseURL == "" {
 		baseURL = urlhelper.GetBaseURL(r)
 	}
-	location := fmt.Sprintf(
-		"%s/upload/storage/v1/b/%s/o?uploadType=resumable&name=%s&upload_id=%s",
-		baseURL,
-		bucketName,
-		url.PathEscape(objName),
-		uploadID,
-	)
-	header.Set("Location", location)
+	header.Set("Location", resumableUploadLocation(baseURL, bucketName, objName, uploadID))
 	return jsonResponse{
 		data:   newObjectResponse(obj.ObjectAttrs, baseURL),
 		header: header,
 	}
+}
+
+func resumableUploadLocation(baseURL, bucketName, objName, uploadID string) string {
+	return fmt.Sprintf(
+		"%s/upload/storage/v1/b/%s/o?uploadType=resumable&name=%s&upload_id=%s",
+		baseURL,
+		url.PathEscape(bucketName),
+		url.QueryEscape(objName),
+		url.QueryEscape(uploadID),
+	)
 }
 
 func (s *Server) handleBodyBasedResumableUpload(r *http.Request, body *resumableUploadBody) jsonResponse {
@@ -370,18 +379,11 @@ func (s *Server) handleBodyBasedResumableUpload(r *http.Request, body *resumable
 	if baseURL == "" {
 		baseURL = s.URL()
 	}
-	location := fmt.Sprintf(
-		"%s/upload/storage/v1/b/%s/o?uploadType=resumable&name=%s&upload_id=%s",
-		baseURL,
-		bucketName,
-		url.PathEscape(body.Name),
-		uploadID,
-	)
-	header.Set("Location", location)
+	header.Set("Location", resumableUploadLocation(baseURL, bucketName, body.Name, uploadID))
 
 	// Set gcloud CLI specific headers
 	if r.Header.Get("X-Goog-Upload-Command") == "start" {
-		header.Set("X-Goog-Upload-URL", location)
+		header.Set("X-Goog-Upload-URL", header.Get("Location"))
 		header.Set("X-Goog-Upload-Status", "active")
 	}
 
@@ -830,16 +832,9 @@ func (s *Server) resumableUpload(bucketName string, r *http.Request) jsonRespons
 	}
 	s.uploads.Store(uploadID, resumableUploadEntry{obj: obj, conditions: conditions, declaredMd5: metadata.Md5Hash, declaredCrc32c: metadata.Crc32c})
 	header := make(http.Header)
-	location := fmt.Sprintf(
-		"%s/upload/storage/v1/b/%s/o?uploadType=resumable&name=%s&upload_id=%s",
-		urlhelper.GetBaseURL(r),
-		bucketName,
-		url.PathEscape(objName),
-		uploadID,
-	)
-	header.Set("Location", location)
+	header.Set("Location", resumableUploadLocation(urlhelper.GetBaseURL(r), bucketName, objName, uploadID))
 	if r.Header.Get("X-Goog-Upload-Command") == "start" {
-		header.Set("X-Goog-Upload-URL", location)
+		header.Set("X-Goog-Upload-URL", header.Get("Location"))
 		header.Set("X-Goog-Upload-Status", "active")
 	}
 	return jsonResponse{
@@ -933,13 +928,25 @@ func (s *Server) uploadFileContent(r *http.Request) jsonResponse {
 		s.uploads.Delete(uploadID)
 		streamingObject, err := s.createObject(obj.StreamingObject(), entry.conditions)
 		if err != nil {
-			return errToJsonResponse(err)
+			resp := errToJsonResponse(err)
+			if err == backend.PreConditionFailed {
+				if resp.header == nil {
+					resp.header = make(http.Header)
+				}
+				live, liveErr := s.GetObjectStreaming(obj.BucketName, obj.Name)
+				if liveErr == nil {
+					resp.header.Set("x-goog-generation", strconv.FormatInt(live.Generation, 10))
+					_ = live.Close()
+				}
+			}
+			return resp
 		}
 		defer streamingObject.Close()
 		obj, err = streamingObject.BufferedObject()
 		if err != nil {
 			return errToJsonResponse(err)
 		}
+		responseHeader.Set("x-goog-generation", strconv.FormatInt(obj.Generation, 10))
 	} else {
 		if _, no308 := r.Header["X-Guploader-No-308"]; no308 {
 			// Go client

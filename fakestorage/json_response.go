@@ -108,5 +108,8 @@ func errToJsonResponse(err error) jsonResponse {
 	if err == backend.PreConditionFailed {
 		status = http.StatusPreconditionFailed
 	}
+	if err == backend.InvalidObjectName {
+		status = http.StatusBadRequest
+	}
 	return jsonResponse{errorMessage: err.Error(), status: status}
 }
